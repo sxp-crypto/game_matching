@@ -9,6 +9,13 @@
 
 #include <iostream>
 
+#include <thread> //C++中有一个thread的库，是用来开线程。
+#include <mutex> //互斥锁
+#include <condition_variable> //条件变量，对锁进行封装。
+#include <queue> //自定消费队列使用普通队列就可以。
+//通过条件变量和锁可以将队列包装成一个消费队列。
+#include <vector>
+
 using namespace ::apache::thrift;
 using namespace ::apache::thrift::protocol;
 using namespace ::apache::thrift::transport;
@@ -17,53 +24,165 @@ using namespace ::apache::thrift::server;
 using namespace  ::match_service;
 using namespace std;
 
+//定义一个任务类型
+struct Task {
+    User user;
+    string type;
+};
+
+//自定义消息队列
+struct MessageQueue {
+    queue<Task> q;
+    mutex m;
+    condition_variable cv;
+} message_queue;
+
+//定义一个匹配池
+class Pool {
+    public:
+		//将匹配结果保存
+        void save_result(int a, int b) {
+            printf("Match Result: %d %d\n", a, b);
+        }
+
+        void match() {
+            while(users.size() > 1) {
+                auto a = users[0], b = users[1];
+                users.erase(users.begin());
+                users.erase(users.begin());
+
+                save_result(a.id, b.id);
+            }
+        }
+
+        void add(User user) {
+            users.push_back(user);
+        }
+
+        void remove(User user) {
+            //删除操作通过遍历编号完成
+            for (uint32_t i = 0; i < users.size(); i++)
+                if (users[i].id == user.id) {
+                    users.erase(users.begin() + i);
+                    break;
+                }
+        }
+
+    private:
+        vector<User> users;
+} pool;
+
+/* 不管是添加还是删除，都需要将操作放入队列中。
+ * 因为这里的对象是消费队列，我们需要将所有关于队列的操作都加上锁，防止多个线程同时操作队列，导致出现数据覆盖等问题。
+ *
+ * 说明:当一个线程优先执行含有队列的操作时，就会获取这个锁，那么其它线程执行队列的操作时，就无法获取到锁而卡在那里，直到获取了锁才能执行。因为锁是唯一一个。
+ *
+ */
+
+//生产者
 class MatchHandler : virtual public MatchIf {
- public:
-  MatchHandler() {
-    // Your initialization goes here
-  }
+    public:
+        MatchHandler() {
+            // Your initialization goes here
+        }
 
-  /**
-   * user: 添加的用户信息
-   * info: 附加信息
-   * 在匹配池中添加一个名用户
-   * 
-   * @param user
-   * @param info
-   */
-  int32_t add_user(const User& user, const std::string& info) {
-    // Your implementation goes here
-    printf("add_user\n");
-    return 0;
-  }
+        /**
+         * user: 添加的用户信息
+         * info: 附加信息
+         * 在匹配池中添加一个名用户
+         * 
+         * @param user
+         * @param info
+         */
+        int32_t add_user(const User& user, const std::string& info) {
+            // Your implementation goes here
+            printf("add_user, %d, %s, %d\n", user.id, user.name.c_str(), user.score);
 
-  /**
-   * user: 删除的用户信息
-   * info: 附加信息
-   * 从匹配池中删除一名用户
-   * 
-   * @param user
-   * @param info
-   */
-  int32_t remove_user(const User& user, const std::string& info) {
-    // Your implementation goes here
-    printf("remove_user\n");
-    return 0;
-  }
+			//通过消息队列中的锁将方法锁着。
+            //好处:你不需要进行解锁操作，当方法执行完毕，这个变量就会自动注销掉
+			unique_lock<mutex> lck(message_queue.m);
+			message_queue.q.push({user, "add"});
+			//唤醒所有条件变量
+			message_queue.cv.notify_all();
+			return 0;
+        }
+
+        /**
+         * user: 删除的用户信息
+         * info: 附加信息
+         * 从匹配池中删除一名用户
+         * 
+         * @param user
+         * @param info
+         */
+        int32_t remove_user(const User& user, const std::string& info) {
+            // Your implementation goes here
+            printf("remove_user, %d, %s, %d\n", user.id, user.name.c_str(), user.score);
+			
+			unique_lock<mutex> lck(message_queue.m);
+			message_queue.q.push({user, "remove"});
+			message_queue.cv.notify_all();
+            return 0;
+        }
 
 };
 
-int main(int argc, char **argv) {
-  int port = 9090;
-  ::std::shared_ptr<MatchHandler> handler(new MatchHandler());
-  ::std::shared_ptr<TProcessor> processor(new MatchProcessor(handler));
-  ::std::shared_ptr<TServerTransport> serverTransport(new TServerSocket(port));
-  ::std::shared_ptr<TTransportFactory> transportFactory(new TBufferedTransportFactory());
-  ::std::shared_ptr<TProtocolFactory> protocolFactory(new TBinaryProtocolFactory());
+//消费者
+//写死循环的目的:充当监控器，不停地死循环保证时刻监控是否有用户传进来。
+void consume_task() {
+    while (true) {
+        unique_lock<mutex> lck(message_queue.m);
+        if (message_queue.q.empty()) {
+			/* 因为消费者线程（不止一个）会频繁判断队列是否为空，导致CPU做无用功。
+             * 所以使用条件变量的wait()函数可使得当前线程阻塞，直至条件变量唤醒。
+             * 当线程阻塞的时候，该函数会自动解锁，允许其他线程执行。
+             */
 
-  TSimpleServer server(processor, serverTransport, transportFactory, protocolFactory);
-  cout << "Match Server Start!!!" << endl;
-  server.serve();
-  return 0;
+            message_queue.cv.wait(lck);
+        } else {
+			/* 将队头的任务拿出，就不对队列进行操作。
+             * 故将锁解除并交给需要它的线程，提高效率。
+             * 这里也就是便执行任务的同时边添加和删除用户，两不误。
+             * 别忘记这里是两个线程同时运行哦！
+             *
+             * 经验：处理完共享的对象后，后续不在使用，一定要及时解锁。
+             */
+			auto task = message_queue.q.front();
+			message_queue.q.pop();
+            lck.unlock();
+
+			/* do task
+             * 做任务，本质是将所有内容放入一个类似于池的东西。
+             * 这里我们定义为匹配池。
+             *
+             */
+
+            if (task.type == "add") pool.add(task.user);
+            else if (task.type == "remove") pool.remove(task.user);
+
+            pool.match();
+		}
+    }
+}
+
+int main(int argc, char **argv) {
+    int port = 9090;
+    ::std::shared_ptr<MatchHandler> handler(new MatchHandler());
+    ::std::shared_ptr<TProcessor> processor(new MatchProcessor(handler));
+    ::std::shared_ptr<TServerTransport> serverTransport(new TServerSocket(port));
+    ::std::shared_ptr<TTransportFactory> transportFactory(new TBufferedTransportFactory());
+    ::std::shared_ptr<TProtocolFactory> protocolFactory(new TBinaryProtocolFactory());
+
+    TSimpleServer server(processor, serverTransport, transportFactory, protocolFactory);
+    cout << "Match Server Start!!!" << endl;
+
+	/*thread 变量名(函数指针) 表示开一个线程。
+     *开线程的目的:如果将死循环写在这里，导致serve执行不了。
+     *故需要开一个线程。
+     */
+	thread matching_thead(consume_task); //消费者
+
+    server.serve();                      //生产者
+    return 0;
 }
 
