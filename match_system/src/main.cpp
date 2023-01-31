@@ -2,10 +2,15 @@
 // You should copy it to another filename to avoid overwriting it.
 
 #include "match_server/Match.h"
+#include "save_client/Save.h"
+
 #include <thrift/protocol/TBinaryProtocol.h>
 #include <thrift/server/TSimpleServer.h>
 #include <thrift/transport/TServerSocket.h>
 #include <thrift/transport/TBufferTransports.h>
+
+#include <thrift/transport/TSocket.h>
+#include <thrift/transport/TTransportUtils.h>
 
 #include <iostream>
 
@@ -22,6 +27,7 @@ using namespace ::apache::thrift::transport;
 using namespace ::apache::thrift::server;
 
 using namespace  ::match_service;
+using namespace  ::save_service;
 using namespace std;
 
 //定义一个任务类型
@@ -40,9 +46,25 @@ struct MessageQueue {
 //定义一个匹配池
 class Pool {
     public:
-		//将匹配结果保存
+        //将匹配结果保存
         void save_result(int a, int b) {
             printf("Match Result: %d %d\n", a, b);
+            
+            std::shared_ptr<TTransport> socket(new TSocket("123.57.47.211", 9090));
+            std::shared_ptr<TTransport> transport(new TBufferedTransport(socket));
+            std::shared_ptr<TProtocol> protocol(new TBinaryProtocol(transport));
+            SaveClient client(protocol);
+
+            try {
+                transport->open();
+
+                client.save_data("acs_468", "e75e214f", a, b);
+
+                transport->close();
+            } catch (TException& tx) {
+                cout << "ERROR: " << tx.what() << endl;
+            }
+
         }
 
         void match() {
@@ -98,13 +120,13 @@ class MatchHandler : virtual public MatchIf {
             // Your implementation goes here
             printf("add_user, %d, %s, %d\n", user.id, user.name.c_str(), user.score);
 
-			//通过消息队列中的锁将方法锁着。
+            //通过消息队列中的锁将方法锁着。
             //好处:你不需要进行解锁操作，当方法执行完毕，这个变量就会自动注销掉
-			unique_lock<mutex> lck(message_queue.m);
-			message_queue.q.push({user, "add"});
-			//唤醒所有条件变量
-			message_queue.cv.notify_all();
-			return 0;
+            unique_lock<mutex> lck(message_queue.m);
+            message_queue.q.push({user, "add"});
+            //唤醒所有条件变量
+            message_queue.cv.notify_all();
+            return 0;
         }
 
         /**
@@ -118,10 +140,10 @@ class MatchHandler : virtual public MatchIf {
         int32_t remove_user(const User& user, const std::string& info) {
             // Your implementation goes here
             printf("remove_user, %d, %s, %d\n", user.id, user.name.c_str(), user.score);
-			
-			unique_lock<mutex> lck(message_queue.m);
-			message_queue.q.push({user, "remove"});
-			message_queue.cv.notify_all();
+
+            unique_lock<mutex> lck(message_queue.m);
+            message_queue.q.push({user, "remove"});
+            message_queue.cv.notify_all();
             return 0;
         }
 
@@ -133,25 +155,25 @@ void consume_task() {
     while (true) {
         unique_lock<mutex> lck(message_queue.m);
         if (message_queue.q.empty()) {
-			/* 因为消费者线程（不止一个）会频繁判断队列是否为空，导致CPU做无用功。
+            /* 因为消费者线程（不止一个）会频繁判断队列是否为空，导致CPU做无用功。
              * 所以使用条件变量的wait()函数可使得当前线程阻塞，直至条件变量唤醒。
              * 当线程阻塞的时候，该函数会自动解锁，允许其他线程执行。
              */
 
             message_queue.cv.wait(lck);
         } else {
-			/* 将队头的任务拿出，就不对队列进行操作。
+            /* 将队头的任务拿出，就不对队列进行操作。
              * 故将锁解除并交给需要它的线程，提高效率。
              * 这里也就是便执行任务的同时边添加和删除用户，两不误。
              * 别忘记这里是两个线程同时运行哦！
              *
              * 经验：处理完共享的对象后，后续不在使用，一定要及时解锁。
              */
-			auto task = message_queue.q.front();
-			message_queue.q.pop();
+            auto task = message_queue.q.front();
+            message_queue.q.pop();
             lck.unlock();
 
-			/* do task
+            /* do task
              * 做任务，本质是将所有内容放入一个类似于池的东西。
              * 这里我们定义为匹配池。
              *
@@ -161,7 +183,7 @@ void consume_task() {
             else if (task.type == "remove") pool.remove(task.user);
 
             pool.match();
-		}
+        }
     }
 }
 
@@ -176,11 +198,11 @@ int main(int argc, char **argv) {
     TSimpleServer server(processor, serverTransport, transportFactory, protocolFactory);
     cout << "Match Server Start!!!" << endl;
 
-	/*thread 变量名(函数指针) 表示开一个线程。
+    /*thread 变量名(函数指针) 表示开一个线程。
      *开线程的目的:如果将死循环写在这里，导致serve执行不了。
      *故需要开一个线程。
      */
-	thread matching_thead(consume_task); //消费者
+    thread matching_thead(consume_task); //消费者
 
     server.serve();                      //生产者
     return 0;
