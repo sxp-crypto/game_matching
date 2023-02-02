@@ -13,6 +13,7 @@
 #include <thrift/transport/TTransportUtils.h>
 
 #include <iostream>
+#include <algorithm>
 
 #include <thread> //C++中有一个thread的库，是用来开线程。
 #include <mutex> //互斥锁
@@ -49,7 +50,7 @@ class Pool {
         //将匹配结果保存
         void save_result(int a, int b) {
             printf("Match Result: %d %d\n", a, b);
-            
+
             std::shared_ptr<TTransport> socket(new TSocket("123.57.47.211", 9090));
             std::shared_ptr<TTransport> transport(new TBufferedTransport(socket));
             std::shared_ptr<TProtocol> protocol(new TBinaryProtocol(transport));
@@ -58,9 +59,11 @@ class Pool {
             try {
                 transport->open();
 
-                client.save_data("acs_468", "e75e214f", a, b);
+                int res = client.save_data("acs_468", "e75e214f", a, b);
+                if (!res) puts("success");
+                else puts("fail");
 
-                transport->close();
+                    transport->close();
             } catch (TException& tx) {
                 cout << "ERROR: " << tx.what() << endl;
             }
@@ -69,11 +72,23 @@ class Pool {
 
         void match() {
             while(users.size() > 1) {
-                auto a = users[0], b = users[1];
-                users.erase(users.begin());
-                users.erase(users.begin());
+                sort(users.begin(), users.end(), [&](User a, User b){
+                        return a.score < b.score;
+                        });
+                bool flag = true;
+                for (uint32_t i = 1; i < users.size(); i++) {
+                    auto a = users[i - 1], b = users[i];
+                    if (b.score - a.score <= 50) {
+                        //这个erase是一个左闭右开的区间
+                        users.erase(users.begin() + i - 1, users.begin() + i + 1);
+                        save_result(a.id, b.id);
 
-                save_result(a.id, b.id);
+                        flag = false;
+                        break;
+                    }
+                }
+                //没有玩家匹配时，意味着所有玩家之差>50时，退出循环。
+                if (flag) break;
             }
         }
 
@@ -125,7 +140,7 @@ class MatchHandler : virtual public MatchIf {
             unique_lock<mutex> lck(message_queue.m);
             message_queue.q.push({user, "add"});
             //唤醒所有条件变量
-            message_queue.cv.notify_all();
+            //message_queue.cv.notify_all();
             return 0;
         }
 
@@ -143,7 +158,7 @@ class MatchHandler : virtual public MatchIf {
 
             unique_lock<mutex> lck(message_queue.m);
             message_queue.q.push({user, "remove"});
-            message_queue.cv.notify_all();
+            //message_queue.cv.notify_all();
             return 0;
         }
 
@@ -159,8 +174,10 @@ void consume_task() {
              * 所以使用条件变量的wait()函数可使得当前线程阻塞，直至条件变量唤醒。
              * 当线程阻塞的时候，该函数会自动解锁，允许其他线程执行。
              */
-
-            message_queue.cv.wait(lck);
+            //message_queue.cv.wait(lck);
+            lck.unlock();
+            pool.match();
+            sleep(1);
         } else {
             /* 将队头的任务拿出，就不对队列进行操作。
              * 故将锁解除并交给需要它的线程，提高效率。
