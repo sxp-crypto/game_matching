@@ -11,7 +11,7 @@ from sys import stdin
 
 def operate(op, user_id, username, score):
     # Make socket
-    // localhost or 127.0.0.1 are the same
+    # localhost or 127.0.0.1 are the same
     transport = TSocket.TSocket('127.0.0.1', 9090)
 
     # Buffering is critical. Raw sockets are very slow

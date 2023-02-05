@@ -66,8 +66,7 @@ class Pool {
 
             try {
                 transport->open();
-
-                int res = client.save_data("acs_468", "e75e214f", a, b);
+                int res = client.save_data("acs_986", "b5bc1486", a, b);
                 if (!res) puts("success");
                 else puts("fail");
 
@@ -78,8 +77,23 @@ class Pool {
 
         }
 
+        bool check_match(uint32_t i, uint32_t j) {
+            auto a = users[i], b = users[j];
+
+            int dt = abs(a.score - b.score);
+            int a_max_dif = wt[i] * 50;
+            int b_max_dif = wt[j] * 50;
+
+            //等待时间的50倍作为分差的范围
+            return dt <= a_max_dif && dt <= b_max_dif;
+        }
+
         void match() {
+            for (uint32_t i = 0; i < wt.size(); i++) {
+                wt[i]++;
+            }
             while(users.size() > 1) {
+                /*
                 sort(users.begin(), users.end(), [&](User a, User b){
                         return a.score < b.score;
                         });
@@ -97,11 +111,37 @@ class Pool {
                 }
                 //没有玩家匹配时，意味着所有玩家之差>50时，退出循环。
                 if (flag) break;
+                */
+                bool flag = true;
+                for (uint32_t i = 0; i < users.size(); i++) {
+                    for (uint32_t j = i + 1; j < users.size(); j++) {
+                        if (check_match(i, j)) {
+                            auto a = users[i], b = users[j];
+                            //先删后面的那个，这样前面的下标不会变。
+                            users.erase(users.begin() + j);
+                            users.erase(users.begin() + i);
+                            wt.erase(wt.begin() + j);
+                            wt.erase(wt.begin() + i);
+                            save_result(a.id, b.id);
+                            flag = false;
+                            break;
+                        }
+                    }
+                    if (!flag) {
+                        break;
+                    }
+                }
+
+                //没有玩家匹配时，意味着所有玩家之差>50时，退出循环。
+                if (flag) {
+                    break;
+                }
             }
         }
 
         void add(User user) {
             users.push_back(user);
+            wt.push_back(0);
         }
 
         void remove(User user) {
@@ -109,12 +149,14 @@ class Pool {
             for (uint32_t i = 0; i < users.size(); i++)
                 if (users[i].id == user.id) {
                     users.erase(users.begin() + i);
+                    wt.erase(wt.begin() + i);
                     break;
                 }
         }
 
     private:
         vector<User> users;
+        vector<int> wt;//等待时间，单位：s
 } pool;
 
 /* 不管是添加还是删除，都需要将操作放入队列中。
@@ -226,8 +268,8 @@ void consume_task() {
 
             if (task.type == "add") pool.add(task.user);
             else if (task.type == "remove") pool.remove(task.user);
-
-            pool.match();
+            //这里的匹配删除，因为每过一秒匹配一次，那一秒是为了加入新的用户，看是否与匹配池中的成员匹配成功的。
+            //pool.match();
         }
     }
 }
@@ -251,7 +293,7 @@ int main(int argc, char **argv) {
             std::make_shared<TBinaryProtocolFactory>());
 
 
-    cout << "Match Server Start!!!" << endl;
+    cout << "Match Server Start!!! Version 5.0" << endl;
 
     /*thread 变量名(函数指针) 表示开一个线程。
      *开线程的目的:如果将死循环写在这里，导致serve执行不了。
